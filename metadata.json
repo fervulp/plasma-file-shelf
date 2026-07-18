@@ -1,0 +1,22 @@
+{
+	"KPackageStructure": "Plasma/Applet",
+	"KPlugin": {
+		"Authors": [
+			{
+				"Name": "Custom"
+			}
+		],
+		"Category": "Utilities",
+		"Description": "Temporary drag-and-drop file shelf (like Dropover on macOS)",
+		"Description[ru]": "Временная полка для файлов через drag-and-drop (как Dropover на macOS)",
+		"EnabledByDefault": false,
+		"Icon": "document-multiple",
+		"Id": "com.custom.file_shelf",
+		"License": "GPL-3.0+",
+		"Name": "File Shelf",
+		"Name[ru]": "Полка файлов",
+		"Version": "1.1",
+		"Website": "https://github.com/USERNAME/file-shelf"
+	},
+	"X-Plasma-API-Minimum-Version": "6.0"
+}

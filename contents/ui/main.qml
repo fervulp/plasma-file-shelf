@@ -1,0 +1,1082 @@
+/*
+ * File Shelf — временная «полка» для файлов (аналог Dropover на macOS).
+ *
+ *  • перетащите файл(ы) на иконку в панели — они добавятся на полку;
+ *  • при наведении курсора или подтаскивании файла полка раскрывается;
+ *  • из полки файлы перетаскиваются в другие приложения по одному
+ *    (тянуть за строку) или все сразу (кнопка «Перетащить все»);
+ *  • брошенная на полку ПАПКА автоматически упаковывается в zip
+ *    (по умолчанию в ~/.cache/file-shelf/, базовая папка настраивается),
+ *    и наружу перетаскивается уже архив;
+ *  • список хранится в конфиге плазмоида и переживает перезапуск.
+ *
+ * Формат записи в конфиге (fileList, StringList):
+ *   обычный файл  ->  "file:///path/to/file"
+ *   папка         ->  "file:///cache/name-hash.zip|||file:///path/to/dir"
+ *                      (до "|||" — что тащим наружу, после — оригинал)
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+import QtQuick
+import QtQuick.Layouts
+import org.kde.plasma.plasmoid
+import org.kde.plasma.core as PlasmaCore
+import org.kde.plasma.components as PC3
+import org.kde.plasma.extras as PlasmaExtras
+import org.kde.plasma.plasma5support as P5Support
+import org.kde.kirigami as Kirigami
+import org.kde.draganddrop as DnD
+
+PlasmoidItem {
+	id: root
+
+	readonly property var files: plasmoid.configuration.fileList || []
+	readonly property int count: files.length
+
+	// попап открыт автоматически (по наведению/drag) — такой закрываем сами;
+	// открытый кликом остаётся до клика мимо
+	property bool autoOpened: false
+	// идёт перетаскивание С полки — попап не закрываем
+	property bool dragOut: false
+	// незавершённые проверки/упаковки: источник DataSource -> URL оригинала
+	property var pendingJobs: ({})
+	property int zipJobs: 0
+
+	switchWidth: Kirigami.Units.gridUnit * 8
+	switchHeight: Kirigami.Units.gridUnit * 8
+
+	toolTipMainText: "Полка файлов"
+	toolTipSubText: count > 0
+		? count + " файл(ов) — перетащите из полки или на неё"
+		: "Перетащите сюда файлы"
+
+	// ---------- записи списка ----------
+	// Форматы записи:
+	//   "url"                        — обычный файл (kind = file)
+	//   "dragUrl|||origUrl"          — папка -> zip в кэше (kind = dir, legacy)
+	//   "dragUrl|||origUrl|||ren"    — файл без расширения -> копия в кэше
+	//                                  с определённым расширением
+	//   "url|||url|||txt"            — файл, созданный из брошенного текста
+	function partsOf(e) { return String(e).split("|||") }
+	function kindOf(e) {
+		var p = partsOf(e)
+		if (p.length >= 3)
+			return p[2]
+		return p.length === 2 ? "dir" : "file"
+	}
+	function isDirEntry(e) { return kindOf(e) === "dir" }
+	// у записи есть файл в кэше, который надо подчищать при удалении
+	function hasCacheCopy(e) { return kindOf(e) !== "file" }
+	function dragUrlOf(e) { return partsOf(e)[0] }
+	function origUrlOf(e) {
+		var p = partsOf(e)
+		return p.length >= 2 ? p[1] : p[0]
+	}
+	// URL-ы, которые уедут при «Перетащить все» (для папок — их архивы)
+	readonly property var dragUrls: files.map(e => dragUrlOf(e))
+
+	// ---------- выбор файлов кликами ----------
+	// множество выбранных записей: { entry: true }
+	property var selectedSet: ({})
+	readonly property var selectedDragUrls:
+		files.filter(e => selectedSet[e] === true).map(e => dragUrlOf(e))
+	readonly property int selectedCount: selectedDragUrls.length
+
+	function isSelected(e) { return selectedSet[String(e)] === true }
+	function toggleSelect(e) {
+		var s = {}
+		for (var k in selectedSet)
+			s[k] = selectedSet[k]
+		var key = String(e)
+		if (s[key] === true)
+			delete s[key]
+		else
+			s[key] = true
+		selectedSet = s   // переприсваивание -> обновление привязок
+	}
+	function selectAll() {
+		var s = {}
+		for (var i = 0; i < files.length; i++)
+			s[String(files[i])] = true
+		selectedSet = s
+	}
+	function clearSelection() { selectedSet = ({}) }
+
+	// ---------- операции со списком ----------
+	function shellQuote(s) {
+		return "'" + String(s).replace(/'/g, "'\\''") + "'"
+	}
+
+	// shell-выражение каталога временных архивов. Настраивается в параметрах
+	// (cacheDir — базовая папка); подкаталог file-shelf добавляется всегда,
+	// чтобы «Очистить полку» (rm -rf) не могла задеть чужие файлы.
+	function cacheDirSh() {
+		var p = String(plasmoid.configuration.cacheDir || "").trim().replace(/\/+$/, "")
+		if (p === "" )
+			return '"${XDG_CACHE_HOME:-$HOME/.cache}/file-shelf"'
+		if (p === "~")
+			return '"$HOME/file-shelf"'
+		if (p.indexOf("~/") === 0)
+			return '"$HOME"' + shellQuote(p.substring(1) + "/file-shelf")
+		return shellQuote(p + "/file-shelf")
+	}
+
+	// file:// URL из локального пути с корректным экранированием каждого
+	// сегмента (encodeURI пропускает # и ?, ломая такие имена)
+	function pathToUrl(p) {
+		return "file://" + String(p).split("/").map(encodeURIComponent).join("/")
+	}
+
+	// file:///a%20b -> /a b; для нелокальных URL возвращает ""
+	function urlToPath(u) {
+		var s = String(u)
+		if (s.indexOf("file://") !== 0)
+			return ""
+		s = s.replace(/^file:\/\//, "")
+		try { s = decodeURIComponent(s) } catch (e) { }
+		return s.replace(/\/+$/, "")
+	}
+
+	function entryExists(origUrl) {
+		for (var i = 0; i < files.length; i++)
+			if (origUrlOf(files[i]) === String(origUrl))
+				return true
+		return false
+	}
+
+	function pushEntry(e) {
+		if (entryExists(origUrlOf(e)))
+			return
+		var arr = (plasmoid.configuration.fileList || []).slice()
+		arr.push(String(e))
+		plasmoid.configuration.fileList = arr
+		// добавленный файл сразу выделен — можно тащить/копировать без кликов
+		if (!isSelected(e))
+			toggleSelect(e)
+	}
+
+	// shell-функция: определить расширение файла по содержимому
+	// (file --extension, затем таблица MIME-типов)
+	readonly property string detectExtSh:
+		"detect_ext() {\n"
+		+ "  ext=$(file -b --extension -- \"$1\" 2>/dev/null | cut -d/ -f1)\n"
+		+ "  case \"$ext\" in ''|'???')\n"
+		+ "    mime=$(file -b --mime-type -- \"$1\" 2>/dev/null)\n"
+		+ "    case \"$mime\" in\n"
+		+ "      application/json) ext=json;; application/pdf) ext=pdf;;\n"
+		+ "      application/zip) ext=zip;; application/gzip) ext=gz;;\n"
+		+ "      application/x-tar) ext=tar;; application/x-7z-compressed) ext=7z;;\n"
+		+ "      application/x-rar) ext=rar;; application/x-iso9660-image) ext=iso;;\n"
+		+ "      text/html) ext=html;; text/csv) ext=csv;;\n"
+		+ "      text/x-shellscript) ext=sh;; text/x-python|text/x-script.python) ext=py;;\n"
+		+ "      image/png) ext=png;; image/jpeg) ext=jpg;; image/gif) ext=gif;;\n"
+		+ "      image/webp) ext=webp;; image/svg+xml) ext=svg;; image/bmp) ext=bmp;;\n"
+		+ "      image/avif) ext=avif;;\n"
+		+ "      audio/mpeg) ext=mp3;; audio/flac) ext=flac;; audio/ogg) ext=ogg;;\n"
+		+ "      video/mp4) ext=mp4;; video/x-matroska) ext=mkv;; video/webm) ext=webm;;\n"
+		+ "      text/*) ext=txt;; *) ext=\"\";;\n"
+		+ "    esac;;\n"
+		+ "  esac\n"
+		+ "  printf %s \"$ext\"\n"
+		+ "}\n"
+
+	// приём брошенных URL: локальные проверяем (файл/папка) и папки пакуем;
+	// http(s)-ссылки (например, картинка из браузера) скачиваются в кэш,
+	// и файл получает расширение по своему содержимому
+	function addUrls(urls) {
+		if (!urls || urls.length === 0)
+			return
+		for (var i = 0; i < urls.length; i++) {
+			var u = String(urls[i])
+			if (u.length === 0 || entryExists(u))
+				continue
+			var path = urlToPath(u)
+			if (path.length === 0) {
+				if (u.indexOf("http://") === 0 || u.indexOf("https://") === 0)
+					addWebUrl(u)
+				else
+					pushEntry(u)
+				continue
+			}
+			// имя архива — чистое, по имени папки; от коллизий одинаковых
+			// имён защищает подкаталог с хэшем пути, а не приписка к имени.
+			// Файл БЕЗ расширения: тип определяется утилитой file, в кэш
+			// кладётся копия с правильным расширением (оригинал не трогаем).
+			var cmd = detectExtSh
+				+ "p=" + shellQuote(path) + "\n"
+				+ "cache=" + cacheDirSh() + "\n"
+				+ "if [ -d \"$p\" ]; then\n"
+				+ "  h=$(printf %s \"$p\" | md5sum | cut -c1-8)\n"
+				+ "  d=\"$cache/$h\"\n"
+				+ "  mkdir -p \"$d\"\n"
+				+ "  out=\"$d/$(basename \"$p\").zip\"\n"
+				+ "  rm -f \"$out\"\n"
+				+ "  (cd \"$(dirname \"$p\")\" && zip -qry \"$out\" \"$(basename \"$p\")\")\n"
+				+ "  echo \"DIR|||$out\"\n"
+				+ "elif [ -e \"$p\" ]; then\n"
+				+ "  base=$(basename \"$p\"); ext=\"\"\n"
+				+ "  case \"$base\" in *.*) ;; *) ext=$(detect_ext \"$p\");; esac\n"
+				+ "  if [ -n \"$ext\" ]; then\n"
+				+ "    h=$(printf %s \"$p\" | md5sum | cut -c1-8)\n"
+				+ "    d=\"$cache/$h\"\n"
+				+ "    mkdir -p \"$d\"\n"
+				+ "    out=\"$d/$base.$ext\"\n"
+				+ "    cp -f -- \"$p\" \"$out\"\n"
+				+ "    echo \"REN|||$out\"\n"
+				+ "  else echo FILE; fi\n"
+				+ "else echo MISSING\n"
+				+ "fi"
+			var jobs = {}
+			for (var k in pendingJobs)
+				jobs[k] = pendingJobs[k]
+			jobs[cmd] = u
+			pendingJobs = jobs
+			zipJobs = zipJobs + 1
+			probeRunner.connectSource(cmd)
+		}
+	}
+
+	// скачивание http(s)-ссылки в кэш: картинки из браузера часто
+	// прилетают без расширения — после загрузки тип определяется по
+	// содержимому и расширение (png/jpg/…) добавляется автоматически
+	function addWebUrl(u) {
+		var cmd = detectExtSh
+			+ "u=" + shellQuote(u) + "\n"
+			+ "cache=" + cacheDirSh() + "\n"
+			+ "h=$(printf %s \"$u\" | md5sum | cut -c1-8)\n"
+			+ "d=\"$cache/web-$h\"\n"
+			+ "mkdir -p \"$d\"\n"
+			+ "base=$(basename \"${u%%[?#]*}\")\n"
+			+ "case \"$base\" in ''|'/'|'.'|'..') base=image;; esac\n"
+			+ "out=\"$d/$base\"\n"
+			+ "if curl -Lsf --max-time 90 -o \"$out\" -- \"$u\" 2>/dev/null"
+			+ " || wget -q -T 90 -O \"$out\" \"$u\" 2>/dev/null; then\n"
+			+ "  case \"$base\" in\n"
+			+ "    *.*) echo \"WEB|||$out\";;\n"
+			+ "    *)\n"
+			+ "      ext=$(detect_ext \"$out\")\n"
+			+ "      if [ -n \"$ext\" ]; then\n"
+			+ "        mv -f -- \"$out\" \"$out.$ext\"\n"
+			+ "        echo \"WEB|||$out.$ext\"\n"
+			+ "      else echo \"WEB|||$out\"; fi;;\n"
+			+ "  esac\n"
+			+ "else\n"
+			+ "  rm -rf \"$d\"\n"
+			+ "  echo MISSING\n"
+			+ "fi"
+		var jobs = {}
+		for (var k in pendingJobs)
+			jobs[k] = pendingJobs[k]
+		jobs[cmd] = u
+		pendingJobs = jobs
+		zipJobs = zipJobs + 1
+		probeRunner.connectSource(cmd)
+	}
+
+	// приём брошенного ТЕКСТА: создаётся .txt в кэше, имя — первые три
+	// слова текста
+	function textFileName(t) {
+		var name = String(t).trim().split(/\s+/).slice(0, 3).join(" ")
+		name = name.replace(/[\/\\:*?"<>|\x00-\x1f]/g, "").trim()
+		if (name.length > 40)
+			name = name.substring(0, 40).trim()
+		if (name.length === 0)
+			name = "текст"
+		return name + ".txt"
+	}
+
+	function addText(t) {
+		var text = String(t || "")
+		if (text.trim().length === 0)
+			return
+		var cmd = "cache=" + cacheDirSh() + "\n"
+			+ "h=$(printf %s " + shellQuote(text) + " | md5sum | cut -c1-8)\n"
+			+ "d=\"$cache/txt-$h\"\n"
+			+ "mkdir -p \"$d\"\n"
+			+ "f=\"$d\"/" + shellQuote(textFileName(text)) + "\n"
+			+ "printf '%s\\n' " + shellQuote(text) + " > \"$f\"\n"
+			+ "echo \"TXT|||$f\""
+		var jobs = {}
+		for (var k in pendingJobs)
+			jobs[k] = pendingJobs[k]
+		jobs[cmd] = ""
+		pendingJobs = jobs
+		zipJobs = zipJobs + 1
+		probeRunner.connectSource(cmd)
+	}
+
+	function removeEntry(e) {
+		var arr = (plasmoid.configuration.fileList || []).slice()
+		var idx = arr.indexOf(String(e))
+		if (idx < 0)
+			return
+		arr.splice(idx, 1)
+		plasmoid.configuration.fileList = arr
+		if (isSelected(e))
+			toggleSelect(e)
+		// подчищаем файл записи из кэша (вместе с hash-подкаталогом)
+		if (hasCacheCopy(e)) {
+			var zp = urlToPath(dragUrlOf(e))
+			if (zp.length > 0)
+				cleanupRunner.connectSource("zp=" + shellQuote(zp)
+					+ "; rm -f \"$zp\"; rmdir \"$(dirname \"$zp\")\" 2>/dev/null")
+		}
+	}
+
+	// Ctrl+C: выделенные файлы -> буфер обмена (text/uri-list, чтобы
+	// «Вставить» работала в Dolphin и др.). Папки уходят архивами.
+	property int copiedFlash: 0
+	Timer {
+		id: copiedTimer
+		interval: 1500
+		onTriggered: root.copiedFlash = 0
+	}
+	function copySelected() {
+		if (selectedCount === 0)
+			return
+		var uris = selectedDragUrls.join("\n") + "\n"
+		cleanupRunner.connectSource("printf %s " + shellQuote(uris)
+			+ " | { wl-copy -t text/uri-list 2>/dev/null"
+			+ " || xclip -selection clipboard -t text/uri-list 2>/dev/null; }")
+		copiedFlash = selectedCount
+		copiedTimer.restart()
+	}
+
+	// ---------- размеры файлов ----------
+	// { dragUrl: байты }; для папок — размер их zip-архива
+	property var sizeMap: ({})
+	property var sizeJobs: ({})
+
+	readonly property double totalBytes: {
+		var t = 0
+		for (var i = 0; i < files.length; i++) {
+			var v = sizeMap[dragUrlOf(files[i])]
+			if (v > 0)
+				t += v
+		}
+		return t
+	}
+
+	function humanSize(b) {
+		if (b === undefined || b < 0)
+			return ""
+		if (b < 1024) return b + " Б"
+		if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " КБ"
+		if (b < 1024 * 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + " МБ"
+		return (b / 1024 / 1024 / 1024).toFixed(2) + " ГБ"
+	}
+
+	onFilesChanged: refreshSizes()
+	Component.onCompleted: refreshSizes()
+
+	function refreshSizes() {
+		if (files.length === 0) {
+			sizeMap = ({})
+			return
+		}
+		var urls = files.map(e => dragUrlOf(e))
+		var cmd = ""
+		for (var i = 0; i < urls.length; i++)
+			cmd += "stat -Lc %s -- " + shellQuote(urlToPath(urls[i]))
+				+ " 2>/dev/null || echo -1\n"
+		var jobs = {}
+		for (var k in sizeJobs)
+			jobs[k] = sizeJobs[k]
+		jobs[cmd] = urls
+		sizeJobs = jobs
+		sizeRunner.connectSource(cmd)
+	}
+
+	P5Support.DataSource {
+		id: sizeRunner
+		engine: "executable"
+		connectedSources: []
+		onNewData: (source, data) => {
+			disconnectSource(source)
+			var snap = root.sizeJobs[source]
+			if (snap === undefined)
+				return
+			var jobs = {}
+			for (var k in root.sizeJobs)
+				if (k !== source)
+					jobs[k] = root.sizeJobs[k]
+			root.sizeJobs = jobs
+			var lines = ((data["stdout"] || "")).trim().split("\n")
+			var m = {}
+			for (var i = 0; i < snap.length && i < lines.length; i++)
+				m[snap[i]] = parseInt(lines[i])
+			root.sizeMap = m
+		}
+	}
+
+	// «Отправить в Ark»: диалог создания архива (формат + пароль-шифрование)
+	// из выделенных файлов, а если ничего не выделено — из всех.
+	// Папки передаются оригиналами, чтобы архивировалась сама папка.
+	//
+	// После закрытия Ark ищем архив, появившийся в папке первого файла
+	// (туда Ark по умолчанию и кладёт результат): если нашёлся — убираем
+	// с полки заархивированные файлы и кладём вместо них сам архив.
+	property var arkJobs: ({})   // источник DataSource -> заархивированные записи
+	property bool arkWaiting: false
+
+	function sendToArk() {
+		var entries = files.filter(e => selectedCount === 0 || isSelected(e))
+		var paths = []
+		for (var i = 0; i < entries.length; i++) {
+			var p = urlToPath(origUrlOf(entries[i]))
+			if (p.length > 0)
+				paths.push(p)
+		}
+		if (paths.length === 0)
+			return
+		var watchDir = paths[0].substring(0, paths[0].lastIndexOf("/"))
+		if (watchDir.length === 0)
+			watchDir = "/"
+		var cmd = "cache=" + cacheDirSh() + "; mkdir -p \"$cache\"\n"
+			+ "m=$(mktemp \"$cache/marker.XXXXXX\")\n"
+			+ "ark --add --dialog"
+			+ paths.map(p => " " + shellQuote(p)).join("")
+			+ " >/dev/null 2>&1\n"
+			+ "find " + shellQuote(watchDir) + " -maxdepth 1 -type f -newer \"$m\" "
+			+ "\\( -name '*.zip' -o -name '*.7z' -o -name '*.tar' -o -name '*.tar.*' -o -name '*.tgz' \\) "
+			+ "-printf '%T@|%p\\n' 2>/dev/null | sort -nr | head -1 | cut -d'|' -f2-\n"
+			+ "rm -f \"$m\""
+		var jobs = {}
+		for (var k in arkJobs)
+			jobs[k] = arkJobs[k]
+		jobs[cmd] = entries
+		arkJobs = jobs
+		arkWaiting = true
+		arkRunner.connectSource(cmd)
+	}
+
+	// заменяет заархивированные записи одной записью-архивом
+	function replaceWithArchive(entries, archivePath) {
+		var archiveUrl = pathToUrl(archivePath)
+		var removeSet = {}
+		for (var i = 0; i < entries.length; i++)
+			removeSet[String(entries[i])] = true
+		var arr = (plasmoid.configuration.fileList || []).slice()
+		var kept = []
+		for (var j = 0; j < arr.length; j++) {
+			var e = String(arr[j])
+			if (removeSet[e] !== true) {
+				kept.push(e)
+				continue
+			}
+			// файлы из кэша (zip папок, копии, txt) больше не нужны
+			if (hasCacheCopy(e)) {
+				var zp = urlToPath(dragUrlOf(e))
+				if (zp.length > 0)
+					cleanupRunner.connectSource("zp=" + shellQuote(zp)
+						+ "; rm -f \"$zp\"; rmdir \"$(dirname \"$zp\")\" 2>/dev/null")
+			}
+		}
+		if (kept.indexOf(archiveUrl) < 0)
+			kept.push(archiveUrl)
+		plasmoid.configuration.fileList = kept
+		clearSelection()
+	}
+
+	// ждёт закрытия Ark и сообщает путь созданного архива (или пусто)
+	P5Support.DataSource {
+		id: arkRunner
+		engine: "executable"
+		connectedSources: []
+		onNewData: (source, data) => {
+			disconnectSource(source)
+			var entries = root.arkJobs[source]
+			var jobs = {}
+			for (var k in root.arkJobs)
+				if (k !== source)
+					jobs[k] = root.arkJobs[k]
+			root.arkJobs = jobs
+			root.arkWaiting = false
+			if (entries === undefined)
+				return
+			var archivePath = (data["stdout"] || "").trim()
+			if (archivePath.length > 0)
+				root.replaceWithArchive(entries, archivePath)
+			// пусто — Ark закрыли без создания архива, ничего не меняем
+		}
+	}
+
+	function clearAll() {
+		plasmoid.configuration.fileList = []
+		clearSelection()
+		cleanupRunner.connectSource("rm -rf " + cacheDirSh())
+	}
+
+	// проверяет, папка ли это, и пакует папку в zip
+	P5Support.DataSource {
+		id: probeRunner
+		engine: "executable"
+		connectedSources: []
+		onNewData: (source, data) => {
+			disconnectSource(source)
+			var orig = root.pendingJobs[source]
+			if (orig === undefined)
+				return
+			var jobs = {}
+			for (var k in root.pendingJobs)
+				if (k !== source)
+					jobs[k] = root.pendingJobs[k]
+			root.pendingJobs = jobs
+			root.zipJobs = Math.max(0, root.zipJobs - 1)
+
+			var out = (data["stdout"] || "").trim()
+			if (out.indexOf("DIR|||") === 0) {
+				var zipPath = out.substring(6)
+				root.pushEntry(root.pathToUrl(zipPath) + "|||" + orig)
+			} else if (out.indexOf("REN|||") === 0) {
+				// копия файла без расширения с определённым типом
+				var renPath = out.substring(6)
+				root.pushEntry(root.pathToUrl(renPath) + "|||" + orig + "|||ren")
+			} else if (out.indexOf("WEB|||") === 0) {
+				// скачанная http(s)-ссылка
+				root.pushEntry(root.pathToUrl(out.substring(6)) + "|||" + orig + "|||web")
+			} else if (out.indexOf("TXT|||") === 0) {
+				// файл, созданный из брошенного текста
+				var txtUrl = root.pathToUrl(out.substring(6))
+				root.pushEntry(txtUrl + "|||" + txtUrl + "|||txt")
+			} else if (out === "FILE") {
+				root.pushEntry(orig)
+			}
+			// MISSING — молча игнорируем
+		}
+	}
+
+	// вспомогательные shell-команды: удаление архивов из кэша, wl-copy
+	// (вывод не нужен)
+	P5Support.DataSource {
+		id: cleanupRunner
+		engine: "executable"
+		connectedSources: []
+		onNewData: (source, data) => disconnectSource(source)
+	}
+
+	// ---------- отображение ----------
+	function fileName(u) {
+		var s = String(u)
+		try { s = decodeURIComponent(s) } catch (e) { }
+		s = s.replace(/\/+$/, "")
+		return s.substring(s.lastIndexOf("/") + 1)
+	}
+
+	function extOf(u) {
+		var n = fileName(u).toLowerCase()
+		var d = n.lastIndexOf(".")
+		return d > 0 ? n.substring(d + 1) : ""
+	}
+
+	function isImage(u) {
+		return ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"]
+			.indexOf(extOf(u)) >= 0
+	}
+
+	function iconFor(u) {
+		var e = extOf(u)
+		if (e === "") return "unknown"
+		if (isImage(u)) return "image-x-generic"
+		if (["mp4", "mkv", "webm", "avi", "mov", "m4v"].indexOf(e) >= 0) return "video-x-generic"
+		if (["mp3", "flac", "ogg", "wav", "m4a", "opus"].indexOf(e) >= 0) return "audio-x-generic"
+		if (["zip", "tar", "gz", "xz", "zst", "7z", "rar", "bz2"].indexOf(e) >= 0) return "application-zip"
+		if (e === "pdf") return "application-pdf"
+		if (["doc", "docx", "odt", "rtf"].indexOf(e) >= 0) return "x-office-document"
+		if (["xls", "xlsx", "ods", "csv"].indexOf(e) >= 0) return "x-office-spreadsheet"
+		if (["ppt", "pptx", "odp"].indexOf(e) >= 0) return "x-office-presentation"
+		if (["html", "htm"].indexOf(e) >= 0) return "text-html"
+		if (["sh", "py", "js", "qml", "cpp", "c", "h", "rs", "go", "json", "xml"].indexOf(e) >= 0) return "text-x-script"
+		if (["txt", "md", "log"].indexOf(e) >= 0) return "text-x-generic"
+		if (["iso", "img"].indexOf(e) >= 0) return "application-x-cd-image"
+		return "text-x-generic"
+	}
+
+	// автозакрытие попапа, открытого наведением: срабатывает, когда курсор
+	// ушёл и с иконки, и с попапа (и мы ничего не перетаскиваем)
+	Timer {
+		id: autoCloseTimer
+		interval: 900
+		onTriggered: {
+			if (root.autoOpened && !root.dragOut) {
+				root.expanded = false
+				root.autoOpened = false
+			}
+		}
+	}
+
+	// ---------- зона открытия у края экрана ----------
+	// Wayland не сообщает плазмоиду о перетаскивании над чужими окнами,
+	// поэтому «открыть полку, когда началось перетаскивание» напрямую
+	// невозможно. Вместо этого — узкая полоска у края экрана: поднёс
+	// перетаскиваемый файл к краю -> полка открылась; бросить можно и
+	// прямо на полоску. Полоска перехватывает клики в своих 6 px,
+	// поэтому опция выключена по умолчанию и край настраивается.
+	readonly property rect screenGeom: {
+		var c = Plasmoid.containment
+		return c && c.screenGeometry !== undefined
+			? c.screenGeometry : Qt.rect(0, 0, 1920, 1080)
+	}
+
+	PlasmaCore.Dialog {
+		id: edgeZone
+		visible: plasmoid.configuration.edgeOpen === true
+		location: PlasmaCore.Types.Floating
+		flags: Qt.WindowDoesNotAcceptFocus | Qt.WindowStaysOnTopHint
+		backgroundHints: PlasmaCore.Types.NoBackground
+		hideOnWindowDeactivate: false
+
+		readonly property string edge: plasmoid.configuration.edgeOpenEdge || "right"
+		readonly property bool horiz: edge === "top" || edge === "bottom"
+		readonly property int thick: 6
+		readonly property rect sg: root.screenGeom
+
+		x: horiz ? sg.x + Math.round((sg.width - mainItem.width) / 2)
+		         : (edge === "left" ? sg.x : sg.x + sg.width - thick)
+		y: horiz ? (edge === "top" ? sg.y : sg.y + sg.height - thick)
+		         : sg.y + Math.round((sg.height - mainItem.height) / 2)
+
+		// центральные 70% края — углы оставляем «горячим углам» KDE
+		mainItem: Item {
+			width: edgeZone.horiz ? Math.round(edgeZone.sg.width * 0.7) : edgeZone.thick
+			height: edgeZone.horiz ? edgeZone.thick : Math.round(edgeZone.sg.height * 0.7)
+
+			DnD.DropArea {
+				id: edgeDrop
+				anchors.fill: parent
+				property bool hovering: false
+				onDragEnter: {
+					hovering = true
+					autoCloseTimer.stop()
+					root.autoOpened = true
+					root.expanded = true
+				}
+				onDragLeave: hovering = false
+				onDrop: event => {
+					hovering = false
+					if (event.mimeData.urls && event.mimeData.urls.length > 0)
+						root.addUrls(event.mimeData.urls)
+					else if (event.mimeData.text && event.mimeData.text.length > 0)
+						root.addText(event.mimeData.text)
+				}
+			}
+
+			// подсветка полоски, когда к ней поднесли файл
+			Rectangle {
+				anchors.fill: parent
+				color: Kirigami.Theme.highlightColor
+				opacity: edgeDrop.hovering ? 0.8 : 0.12
+			}
+		}
+	}
+
+	preferredRepresentation: compactRepresentation
+
+	// ================= компактный вид (иконка в панели) =================
+	compactRepresentation: MouseArea {
+		id: compact
+		hoverEnabled: true
+		// ширина области наведения/броска настраивается (0 = размер иконки)
+		implicitWidth: plasmoid.configuration.hoverWidth > 0
+			? plasmoid.configuration.hoverWidth
+			: Kirigami.Units.iconSizes.medium
+		implicitHeight: Kirigami.Units.iconSizes.medium
+
+		onClicked: {
+			root.autoOpened = false
+			root.expanded = !root.expanded
+		}
+		// наведение курсора -> раскрыть с небольшой задержкой (без дёрганья)
+		onEntered: { autoCloseTimer.stop(); hoverExpandTimer.restart() }
+		onExited:  { hoverExpandTimer.stop(); autoCloseTimer.restart() }
+
+		Timer {
+			id: hoverExpandTimer
+			interval: 300
+			onTriggered: {
+				if (!root.expanded) {
+					root.autoOpened = true
+					root.expanded = true
+				}
+			}
+		}
+
+		Kirigami.Icon {
+			// иконка по центру, не растягивается при широкой области наведения
+			anchors.centerIn: parent
+			width: Math.min(parent.width, parent.height)
+			height: width
+			source: plasmoid.configuration.panelIcon || "document-multiple"
+			active: compact.containsMouse
+		}
+
+		// счётчик файлов
+		Rectangle {
+			visible: root.count > 0
+			anchors.right: parent.right
+			anchors.top: parent.top
+			height: badgeText.implicitHeight + 2
+			width: Math.max(height, badgeText.implicitWidth + 6)
+			radius: height / 2
+			color: Kirigami.Theme.highlightColor
+			Text {
+				id: badgeText
+				anchors.centerIn: parent
+				text: root.count
+				color: Kirigami.Theme.highlightedTextColor
+				font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+				font.bold: true
+			}
+		}
+
+		// приём файлов прямо на иконку + раскрытие при подтаскивании
+		DnD.DropArea {
+			anchors.fill: parent
+			preventStealing: true
+			onDragEnter: {
+				autoCloseTimer.stop()
+				root.autoOpened = true
+				root.expanded = true
+			}
+			onDrop: event => {
+				if (event.mimeData.urls && event.mimeData.urls.length > 0)
+					root.addUrls(event.mimeData.urls)
+				else if (event.mimeData.text && event.mimeData.text.length > 0)
+					root.addText(event.mimeData.text)
+			}
+		}
+	}
+
+	// ================= полный вид (попап-полка) =================
+	fullRepresentation: Item {
+		id: fullRep
+
+		Layout.preferredWidth: Kirigami.Units.gridUnit * 18
+		Layout.preferredHeight: Kirigami.Units.gridUnit * 20
+		Layout.minimumWidth: Kirigami.Units.gridUnit * 14
+		Layout.minimumHeight: Kirigami.Units.gridUnit * 10
+
+		// горячие клавиши: Ctrl+A — выбрать все, Ctrl+C — скопировать
+		// выделенные в буфер обмена
+		focus: true
+		Keys.onPressed: event => {
+			if (event.matches(StandardKey.SelectAll)) {
+				root.selectAll()
+				event.accepted = true
+			} else if (event.matches(StandardKey.Copy)) {
+				root.copySelected()
+				event.accepted = true
+			}
+		}
+		// при открытии попапа забираем клавиатурный фокус
+		Connections {
+			target: root
+			function onExpandedChanged() {
+				if (root.expanded)
+					fullRep.forceActiveFocus()
+			}
+		}
+
+		// пока курсор на попапе — не закрываем
+		HoverHandler {
+			onHoveredChanged: hovered ? autoCloseTimer.stop() : autoCloseTimer.restart()
+		}
+
+		// приём файлов на весь попап
+		DnD.DropArea {
+			id: popupDrop
+			anchors.fill: parent
+			preventStealing: true
+			property bool hovering: false
+			onDragEnter: { hovering = true; autoCloseTimer.stop() }
+			onDragLeave: hovering = false
+			onDrop: event => {
+				hovering = false
+				if (event.mimeData.urls && event.mimeData.urls.length > 0)
+					root.addUrls(event.mimeData.urls)
+				else if (event.mimeData.text && event.mimeData.text.length > 0)
+					root.addText(event.mimeData.text)
+			}
+		}
+
+		// подсветка при подтаскивании файла
+		Rectangle {
+			anchors.fill: parent
+			radius: 6
+			visible: popupDrop.hovering
+			color: Qt.alpha(Kirigami.Theme.highlightColor, 0.12)
+			border.width: 2
+			border.color: Kirigami.Theme.highlightColor
+			z: 100
+		}
+
+		ColumnLayout {
+			anchors.fill: parent
+			anchors.margins: Kirigami.Units.smallSpacing
+			spacing: Kirigami.Units.smallSpacing
+
+			// ---- шапка: счётчик, «перетащить все», очистка ----
+			RowLayout {
+				Layout.fillWidth: true
+				spacing: Kirigami.Units.smallSpacing
+
+				PC3.Label {
+					Layout.fillWidth: true
+					text: root.copiedFlash > 0
+						? "Скопировано: " + root.copiedFlash
+						: (root.count === 0 ? "Полка файлов"
+							: (root.selectedCount > 0
+								? "Выбрано: " + root.selectedCount + " из " + root.count
+								: "Файлов: " + root.count))
+					font.bold: true
+					elide: Text.ElideRight
+				}
+
+				// выбрать все / снять выбор
+				PC3.ToolButton {
+					visible: root.count > 0
+					icon.name: root.selectedCount === root.count && root.count > 0
+						? "edit-select-none" : "edit-select-all"
+					text: root.selectedCount === root.count && root.count > 0
+						? "Снять выбор" : "Выбрать все"
+					PC3.ToolTip.text: "Клик по строке тоже выбирает файл"
+					PC3.ToolTip.visible: hovered
+					onClicked: root.selectedCount === root.count
+						? root.clearSelection() : root.selectAll()
+				}
+
+				// упаковать/зашифровать через Ark
+				PC3.ToolButton {
+					visible: root.count > 0
+					icon.name: "utilities-file-archiver"
+					PC3.ToolTip.text: root.selectedCount > 0
+						? "Упаковать выделенные в архив (Ark, можно с паролем)"
+						: "Упаковать все в архив (Ark, можно с паролем)"
+					PC3.ToolTip.visible: hovered
+					onClicked: root.sendToArk()
+				}
+
+				PC3.ToolButton {
+					visible: root.count > 0
+					icon.name: "edit-clear-all"
+					PC3.ToolTip.text: "Очистить полку"
+					PC3.ToolTip.visible: hovered
+					onClicked: root.clearAll()
+				}
+			}
+
+			// ---- идёт упаковка папки / открыт Ark ----
+			RowLayout {
+				visible: root.zipJobs > 0 || root.arkWaiting
+				Layout.fillWidth: true
+				spacing: Kirigami.Units.smallSpacing
+				PC3.BusyIndicator {
+					Layout.preferredWidth: Kirigami.Units.iconSizes.small
+					Layout.preferredHeight: Kirigami.Units.iconSizes.small
+					running: parent.visible
+				}
+				PC3.Label {
+					Layout.fillWidth: true
+					text: root.zipJobs > 0
+						? "Обработка добавленного…"
+						: "Ark открыт — после создания архива файлы заменятся им"
+					opacity: 0.7
+				}
+			}
+
+			// ---- пусто ----
+			PlasmaExtras.PlaceholderMessage {
+				visible: root.count === 0 && root.zipJobs === 0
+				Layout.fillWidth: true
+				Layout.fillHeight: true
+				iconName: "document-import"
+				text: "Полка пуста"
+				explanation: "Перетащите сюда файлы или папки. Папка автоматически упакуется в zip."
+			}
+
+			// ---- список файлов ----
+			ListView {
+				id: listView
+				visible: root.count > 0
+				Layout.fillWidth: true
+				Layout.fillHeight: true
+				clip: true
+				model: root.files
+				spacing: 2
+				// НЕ перехватываем движение мыши: иначе вертикальный drag строки
+				// превращается в прокрутку списка, а не перетаскивание файла
+				interactive: false
+
+				PC3.ScrollBar.vertical: PC3.ScrollBar { id: vScroll }
+
+				// прокрутка колесом (interactive выключен)
+				WheelHandler {
+					target: null
+					onWheel: ev => {
+						var max = Math.max(0, listView.contentHeight - listView.height)
+						listView.contentY = Math.max(0, Math.min(max,
+							listView.contentY - ev.angleDelta.y))
+					}
+				}
+
+				// каждая строка: клик — выбор, зажать и потянуть — перетащить.
+				// Если есть выбранные — за ЛЮБУЮ строку тащатся все выбранные
+				// разом (для папки наружу уезжает zip-архив).
+				// Перетаскивание — нативный QML Drag (Drag.Automatic +
+				// text/uri-list), а не плазменный DragArea: тот в попапе
+				// не начинал drag.
+				delegate: Item {
+					id: itemDrag
+					required property var modelData
+					readonly property string dragUrl: root.dragUrlOf(modelData)
+					readonly property string origUrl: root.origUrlOf(modelData)
+					readonly property string kind: root.kindOf(modelData)
+					readonly property bool isDir: kind === "dir"
+					readonly property bool selected: root.isSelected(modelData)
+					readonly property bool dragsGroup: root.selectedCount > 0
+					// что уедет, если потащить эту строку (формат text/uri-list)
+					readonly property string uriList:
+						(dragsGroup ? root.selectedDragUrls : [dragUrl]).join("\r\n")
+
+					width: ListView.view ? ListView.view.width : 0
+					height: Kirigami.Units.iconSizes.medium + Kirigami.Units.smallSpacing * 2
+
+					Rectangle {
+						anchors.fill: parent
+						radius: 4
+						color: itemDrag.selected
+							? Qt.alpha(Kirigami.Theme.highlightColor, 0.3)
+							: (rowMa.containsMouse
+								? Qt.alpha(Kirigami.Theme.highlightColor, 0.15)
+								: "transparent")
+					}
+
+					MouseArea {
+						id: rowMa
+						anchors.fill: parent
+						hoverEnabled: true
+						drag.target: dragProxy
+						// присваивание вместо привязки: привязка к drag.active
+						// зацикливается, когда старт QDrag сбрасывает захват мыши
+						drag.onActiveChanged: dragProxy.Drag.active = rowMa.drag.active
+						onClicked: root.toggleSelect(itemDrag.modelData)
+						// картинка у курсора при перетаскивании — снимок строки
+						onPressed: itemDrag.grabToImage(result => {
+							dragProxy.Drag.imageSource = result.url
+						})
+					}
+
+					// невидимый носитель drag'а (схема из примера Qt
+					// externaldraganddrop): сдвиг мыши за порог -> внешний QDrag
+					Item {
+						id: dragProxy
+						anchors.fill: parent
+						Drag.dragType: Drag.Automatic
+						Drag.supportedActions: Qt.CopyAction
+						Drag.hotSpot.x: 0
+						Drag.hotSpot.y: 0
+						Drag.mimeData: ({ "text/uri-list": itemDrag.uriList })
+						Drag.onDragStarted: root.dragOut = true
+						Drag.onDragFinished: {
+							root.dragOut = false
+							autoCloseTimer.restart()
+						}
+					}
+
+					RowLayout {
+						anchors.fill: parent
+						anchors.leftMargin: Kirigami.Units.smallSpacing
+						anchors.rightMargin: Kirigami.Units.smallSpacing
+						spacing: Kirigami.Units.smallSpacing
+
+						PC3.CheckBox {
+							checked: itemDrag.selected
+							onToggled: root.toggleSelect(itemDrag.modelData)
+						}
+
+						// превью для картинок, иначе — иконка типа файла
+						Item {
+							Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+							Layout.preferredHeight: Kirigami.Units.iconSizes.medium
+							Image {
+								anchors.fill: parent
+								visible: !itemDrag.isDir && root.isImage(itemDrag.dragUrl)
+								source: visible ? itemDrag.dragUrl : ""
+								fillMode: Image.PreserveAspectCrop
+								asynchronous: true
+								sourceSize.width: Kirigami.Units.iconSizes.medium * 2
+								sourceSize.height: Kirigami.Units.iconSizes.medium * 2
+							}
+							Kirigami.Icon {
+								anchors.fill: parent
+								visible: itemDrag.isDir || !root.isImage(itemDrag.dragUrl)
+								source: itemDrag.isDir ? "folder-tar" : root.iconFor(itemDrag.dragUrl)
+							}
+						}
+
+						ColumnLayout {
+							Layout.fillWidth: true
+							spacing: 0
+							PC3.Label {
+								Layout.fillWidth: true
+								text: itemDrag.kind === "file"
+									? root.fileName(itemDrag.origUrl)
+									: root.fileName(itemDrag.dragUrl)
+								elide: Text.ElideMiddle
+							}
+							PC3.Label {
+								Layout.fillWidth: true
+								readonly property string sizeStr:
+									root.humanSize(root.sizeMap[itemDrag.dragUrl])
+								text: (sizeStr.length > 0 ? sizeStr + "  ·  " : "")
+									+ (itemDrag.kind === "dir"
+										? "Архив папки: " + root.urlToPath(itemDrag.origUrl)
+										: itemDrag.kind === "ren"
+											? "Было без расширения: " + root.urlToPath(itemDrag.origUrl)
+											: itemDrag.kind === "txt"
+												? "Создан из перетащенного текста"
+												: itemDrag.kind === "web"
+													? "Скачано: " + itemDrag.origUrl
+													: root.urlToPath(itemDrag.origUrl))
+								elide: Text.ElideMiddle
+								font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+								opacity: 0.6
+							}
+						}
+
+						// открыть оригинал (файл или папку)
+						PC3.ToolButton {
+							icon.name: "document-open"
+							visible: rowMa.containsMouse
+							PC3.ToolTip.text: "Открыть"
+							PC3.ToolTip.visible: hovered
+							onClicked: Qt.openUrlExternally(itemDrag.origUrl)
+						}
+
+						PC3.ToolButton {
+							icon.name: "edit-delete-remove"
+							opacity: rowMa.containsMouse ? 1 : 0.4
+							PC3.ToolTip.text: "Убрать с полки"
+							PC3.ToolTip.visible: hovered
+							onClicked: root.removeEntry(itemDrag.modelData)
+						}
+					}
+				}
+			}
+
+			// ---- общий вес файлов (еле заметно) ----
+			PC3.Label {
+				visible: root.count > 0 && root.totalBytes > 0
+				Layout.fillWidth: true
+				horizontalAlignment: Text.AlignRight
+				text: "Всего: " + root.humanSize(root.totalBytes)
+				font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+				opacity: 0.45
+			}
+		}
+	}
+}

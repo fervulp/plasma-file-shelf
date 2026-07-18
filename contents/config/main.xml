@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+	http://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
+<kcfgfile name=""/>
+
+	<group name="General">
+		<entry name="fileList" type="StringList">
+			<label>URLs of files currently on the shelf</label>
+			<default></default>
+		</entry>
+		<entry name="panelIcon" type="String">
+			<label>Icon shown in the panel</label>
+			<default>document-multiple</default>
+		</entry>
+		<entry name="hoverWidth" type="Int">
+			<label>Width in pixels of the panel hover/drop area; 0 means icon size</label>
+			<default>0</default>
+		</entry>
+		<entry name="edgeOpen" type="Bool">
+			<label>Open the shelf when a drag touches a screen edge strip</label>
+			<default>false</default>
+		</entry>
+		<entry name="edgeOpenEdge" type="String">
+			<label>Which screen edge hosts the drag-open strip: left/right/top/bottom</label>
+			<default>right</default>
+		</entry>
+		<entry name="cacheDir" type="String">
+			<label>Base directory for temporary files (a "file-shelf" subfolder is created inside it); empty means ~/.cache</label>
+			<default></default>
+		</entry>
+	</group>
+
+</kcfg>
