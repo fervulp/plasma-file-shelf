@@ -296,6 +296,36 @@ PlasmoidItem {
 					copiedTimer.restart()
 			}
 
+			// Ctrl+V: paste from clipboard — file URIs become shelf entries,
+			// plain text becomes a .txt file
+			function pasteClipboard() {
+				pasteRunner.connectSource(
+					"uris=$(wl-paste -n -t text/uri-list 2>/dev/null"
+					+ " || xclip -selection clipboard -o -t text/uri-list 2>/dev/null)\n"
+					+ "if [ -n \"$uris\" ]; then printf 'URIS\\n%s\\n' \"$uris\"\n"
+					+ "else\n"
+					+ "  txt=$(wl-paste -n -t text 2>/dev/null"
+					+ " || xclip -selection clipboard -o 2>/dev/null)\n"
+					+ "  [ -n \"$txt\" ] && printf 'TEXT\\n%s\\n' \"$txt\"\n"
+					+ "fi")
+			}
+
+			P5Support.DataSource {
+				id: pasteRunner
+				engine: "executable"
+				connectedSources: []
+				onNewData: (source, data) => {
+					disconnectSource(source)
+					var out = String(data["stdout"] || "")
+					if (out.indexOf("URIS\n") === 0) {
+						root.addUrls(out.substring(5).trim().split(/\r?\n/)
+							.filter(u => u.length > 0))
+					} else if (out.indexOf("TEXT\n") === 0) {
+						root.addText(out.substring(5).replace(/\n$/, ""))
+					}
+				}
+			}
+
 			property var sizeMap: ({})
 			property var sizeJobs: ({})
 
@@ -368,24 +398,42 @@ PlasmoidItem {
 				var entries = files.filter(e => selectedCount === 0 || isSelected(e))
 				var paths = []
 				for (var i = 0; i < entries.length; i++) {
-					var p = urlToPath(origUrlOf(entries[i]))
+					var e = entries[i]
+					// folders go as originals (the folder itself is archived);
+					// cache-backed entries go as their staged copy (has the
+					// proper name/extension)
+					var p = urlToPath(isDirEntry(e) ? origUrlOf(e) : dragUrlOf(e))
 					if (p.length > 0)
 						paths.push(p)
 				}
 				if (paths.length === 0)
 					return
-					var watchDir = paths[0].substring(0, paths[0].lastIndexOf("/"))
-					if (watchDir.length === 0)
-						watchDir = "/"
-						var cmd = "cache=" + cacheDirSh() + "; mkdir -p \"$cache\"\n"
-						+ "m=$(mktemp \"$cache/marker.XXXXXX\")\n"
-						+ "ark --add --dialog"
-						+ paths.map(p => " " + shellQuote(p)).join("")
-						+ " >/dev/null 2>&1\n"
-						+ "find " + shellQuote(watchDir) + " -maxdepth 1 -type f -newer \"$m\" "
+					// Files are first hard-linked/copied flat into a staging
+					// dir and Ark archives THAT, so the archive contains just
+					// the files — no parent paths like ".cache/…" inside.
+					// The finished archive is moved next to the first
+					// non-cache file (or to $HOME).
+					var cmd = "cache=" + cacheDirSh() + "; mkdir -p \"$cache\"\n"
+						+ "stage=$(mktemp -d \"$cache/ark-stage.XXXXXX\")\n"
+						+ "dest=\"\"\n"
+						+ "for p in " + paths.map(p => shellQuote(p)).join(" ") + "; do\n"
+						+ "  case \"$p\" in \"$cache\"/*) ;; *) [ -z \"$dest\" ] && dest=$(dirname \"$p\");; esac\n"
+						+ "  b=$(basename \"$p\"); t=\"$stage/$b\"; i=1\n"
+						+ "  while [ -e \"$t\" ]; do t=\"$stage/${i}_$b\"; i=$((i+1)); done\n"
+						+ "  ln -- \"$p\" \"$t\" 2>/dev/null || cp -a -- \"$p\" \"$t\"\n"
+						+ "done\n"
+						+ "[ -z \"$dest\" ] && dest=\"$HOME\"\n"
+						+ "m=$(mktemp \"$stage/.marker.XXXXXX\")\n"
+						+ "ark --add --dialog \"$stage\"/* >/dev/null 2>&1\n"
+						+ "out=$(find \"$stage\" -maxdepth 1 -type f -newer \"$m\" "
 						+ "\\( -name '*.zip' -o -name '*.7z' -o -name '*.tar' -o -name '*.tar.*' -o -name '*.tgz' \\) "
-						+ "-printf '%T@|%p\\n' 2>/dev/null | sort -nr | head -1 | cut -d'|' -f2-\n"
-						+ "rm -f \"$m\""
+						+ "-printf '%T@|%p\\n' 2>/dev/null | sort -nr | head -1 | cut -d'|' -f2-)\n"
+						+ "if [ -n \"$out\" ]; then\n"
+						+ "  n=$(basename \"$out\"); f=\"$dest/$n\"; i=1\n"
+						+ "  while [ -e \"$f\" ]; do f=\"$dest/${i}_$n\"; i=$((i+1)); done\n"
+						+ "  mv -- \"$out\" \"$f\" && printf %s \"$f\"\n"
+						+ "fi\n"
+						+ "rm -rf \"$stage\""
 						var jobs = {}
 						for (var k in arkJobs)
 							jobs[k] = arkJobs[k]
@@ -561,8 +609,8 @@ PlasmoidItem {
 				: sg.y + Math.round((sg.height - mainItem.height) / 2)
 
 				mainItem: Item {
-					width: edgeZone.horiz ? Math.round(edgeZone.sg.width * 0.7) : edgeZone.thick
-					height: edgeZone.horiz ? edgeZone.thick : Math.round(edgeZone.sg.height * 0.7)
+					width: edgeZone.horiz ? Math.round(edgeZone.sg.width * 0.9) : edgeZone.thick
+					height: edgeZone.horiz ? edgeZone.thick : Math.round(edgeZone.sg.height * 0.9)
 
 					DnD.DropArea {
 						id: edgeDrop
@@ -584,10 +632,12 @@ PlasmoidItem {
 						}
 					}
 
+					// invisible while idle — highlighted only when a drag
+					// approaches, so no stray line is left on screen
 					Rectangle {
 						anchors.fill: parent
 						color: Kirigami.Theme.highlightColor
-						opacity: edgeDrop.hovering ? 0.8 : 0.12
+						opacity: edgeDrop.hovering ? 0.8 : 0
 					}
 				}
 			}
@@ -597,10 +647,16 @@ PlasmoidItem {
 			compactRepresentation: MouseArea {
 				id: compact
 				hoverEnabled: true
-				implicitWidth: plasmoid.configuration.hoverWidth > 0
+				// panels size applets by the Layout attached properties of
+				// the compact representation, not by implicitWidth
+				readonly property int wantedWidth: plasmoid.configuration.hoverWidth > 0
 				? plasmoid.configuration.hoverWidth
 				: Kirigami.Units.iconSizes.medium
+				implicitWidth: wantedWidth
 				implicitHeight: Kirigami.Units.iconSizes.medium
+				Layout.minimumWidth: wantedWidth
+				Layout.preferredWidth: wantedWidth
+				Layout.maximumWidth: wantedWidth
 
 				onClicked: {
 					root.autoOpened = false
@@ -679,6 +735,9 @@ PlasmoidItem {
 					} else if (event.matches(StandardKey.Copy)) {
 						root.copySelected()
 						event.accepted = true
+					} else if (event.matches(StandardKey.Paste)) {
+						root.pasteClipboard()
+						event.accepted = true
 					}
 				}
 				Connections {
@@ -748,6 +807,7 @@ PlasmoidItem {
 							? "Deselect All" : "Select All"
 							PC3.ToolTip.text: "Clicking a row also selects the file"
 							PC3.ToolTip.visible: hovered
+							PC3.ToolTip.delay: Kirigami.Units.toolTipDelay
 							onClicked: root.selectedCount === root.count
 							? root.clearSelection() : root.selectAll()
 						}
@@ -759,6 +819,7 @@ PlasmoidItem {
 							? "Pack selected into archive (Ark, support for passwords)"
 							: "Pack all into archive (Ark, support for passwords)"
 							PC3.ToolTip.visible: hovered
+							PC3.ToolTip.delay: Kirigami.Units.toolTipDelay
 							onClicked: root.sendToArk()
 						}
 
@@ -767,6 +828,7 @@ PlasmoidItem {
 							icon.name: "edit-clear-all"
 							PC3.ToolTip.text: "Clear shelf"
 							PC3.ToolTip.visible: hovered
+							PC3.ToolTip.delay: Kirigami.Units.toolTipDelay
 							onClicked: root.clearAll()
 						}
 					}
@@ -936,6 +998,7 @@ PlasmoidItem {
 									visible: rowMa.containsMouse
 									PC3.ToolTip.text: "Open"
 									PC3.ToolTip.visible: hovered
+							PC3.ToolTip.delay: Kirigami.Units.toolTipDelay
 									onClicked: Qt.openUrlExternally(itemDrag.origUrl)
 								}
 
@@ -944,6 +1007,7 @@ PlasmoidItem {
 									opacity: rowMa.containsMouse ? 1 : 0.4
 									PC3.ToolTip.text: "Remove from shelf"
 									PC3.ToolTip.visible: hovered
+							PC3.ToolTip.delay: Kirigami.Units.toolTipDelay
 									onClicked: root.removeEntry(itemDrag.modelData)
 								}
 							}
