@@ -1,15 +1,7 @@
-import QtQuick
-import QtQuick.Controls as QQC2
-import QtQuick.Dialogs
-import QtQuick.Layouts
-import org.kde.kirigami as Kirigami
-import org.kde.kcmutils as KCM
-import org.kde.iconthemes as KIconThemes
-
 KCM.SimpleKCM {
 	id: page
 
-	// служебная запись конфига (сам список полки) — здесь не редактируется
+	// Configuration record (the shelf list itself) — not editable here
 	property var cfg_fileList
 	property alias cfg_cacheDir: dirField.text
 	property alias cfg_hoverWidth: hoverSpin.value
@@ -17,18 +9,18 @@ KCM.SimpleKCM {
 	property string cfg_edgeOpenEdge
 	property string cfg_panelIcon
 
-	// SimpleKCM ждёт ровно ОДНОГО ребёнка-содержимое, поэтому все
-	// невизуальные диалоги вложены внутрь элементов формы
+	// SimpleKCM expects exactly ONE child-content, so all
+	// non-visual dialogs are nested inside form elements
 	Kirigami.FormLayout {
 		RowLayout {
-			Kirigami.FormData.label: "Иконка в панели:"
+			Kirigami.FormData.label: "Panel icon:"
 			spacing: Kirigami.Units.smallSpacing
 
 			QQC2.Button {
 				icon.name: page.cfg_panelIcon || "document-multiple"
 				icon.width: Kirigami.Units.iconSizes.medium
 				icon.height: Kirigami.Units.iconSizes.medium
-				QQC2.ToolTip.text: "Выбрать иконку"
+				QQC2.ToolTip.text: "Select icon"
 				QQC2.ToolTip.visible: hovered
 				onClicked: iconDialog.open()
 
@@ -43,14 +35,14 @@ KCM.SimpleKCM {
 
 			QQC2.Button {
 				icon.name: "edit-undo"
-				text: "По умолчанию"
+				text: "Default"
 				enabled: page.cfg_panelIcon !== "document-multiple"
 				onClicked: page.cfg_panelIcon = "document-multiple"
 			}
 		}
 
 		RowLayout {
-			Kirigami.FormData.label: "Ширина области наведения:"
+			Kirigami.FormData.label: "Hover area width:"
 			spacing: Kirigami.Units.smallSpacing
 
 			QQC2.SpinBox {
@@ -62,7 +54,7 @@ KCM.SimpleKCM {
 			}
 
 			QQC2.Label {
-				text: hoverSpin.value === 0 ? "px (0 — по размеру иконки)" : "px"
+				text: hoverSpin.value === 0 ? "px (0 — by icon size)" : "px"
 				opacity: 0.7
 			}
 		}
@@ -71,18 +63,18 @@ KCM.SimpleKCM {
 
 		QQC2.CheckBox {
 			id: edgeOpenCheck
-			Kirigami.FormData.label: "Перетаскивание:"
-			text: "Открывать полку у края экрана"
+			Kirigami.FormData.label: "Drag and drop:"
+			text: "Open shelf at screen edge"
 		}
 
 		RowLayout {
-			Kirigami.FormData.label: "Край экрана:"
+			Kirigami.FormData.label: "Screen edge:"
 			spacing: Kirigami.Units.smallSpacing
 			enabled: edgeOpenCheck.checked
 
 			QQC2.ComboBox {
 				readonly property var vals: ["right", "left", "top", "bottom"]
-				model: ["Правый", "Левый", "Верхний", "Нижний"]
+				model: ["Right", "Left", "Top", "Bottom"]
 				currentIndex: {
 					var i = vals.indexOf(page.cfg_edgeOpenEdge || "right")
 					return i >= 0 ? i : 0
@@ -97,27 +89,28 @@ KCM.SimpleKCM {
 			wrapMode: Text.WordWrap
 			font.pixelSize: Kirigami.Theme.smallFont.pixelSize
 			opacity: 0.7
-			text: "У выбранного края экрана появится едва заметная полоска "
-				+ "(6 px, центральные 70% края). Поднесите к ней перетаскиваемый "
-				+ "файл — полка откроется; бросить файл можно и прямо на полоску. "
-				+ "Внимание: обычные клики мыши в этой полоске перехватываются ею."
+			text: "A barely visible strip (6 px, central 70% of the edge) "
+			+ "will appear at the selected screen edge. Move a dragged "
+			+ "file to it — the shelf will open; you can also drop the file "
+			+ "directly onto the strip. Note: regular mouse clicks in "
+			+ "this strip are intercepted by it."
 		}
 
 		Item { Kirigami.FormData.isSection: true }
 
 		RowLayout {
-			Kirigami.FormData.label: "Папка для временных файлов:"
+			Kirigami.FormData.label: "Temporary files folder:"
 			spacing: Kirigami.Units.smallSpacing
 
 			QQC2.TextField {
 				id: dirField
 				Layout.fillWidth: true
-				placeholderText: "~/.cache (по умолчанию)"
+				placeholderText: "~/.cache (default)"
 			}
 
 			QQC2.Button {
 				icon.name: "folder-open"
-				QQC2.ToolTip.text: "Выбрать папку"
+				QQC2.ToolTip.text: "Select folder"
 				QQC2.ToolTip.visible: hovered
 				onClicked: folderDialog.open()
 
@@ -141,10 +134,10 @@ KCM.SimpleKCM {
 			wrapMode: Text.WordWrap
 			font.pixelSize: Kirigami.Theme.smallFont.pixelSize
 			opacity: 0.7
-			text: "Внутри указанной папки создаётся подкаталог «file-shelf» — "
-				+ "в нём хранятся zip-архивы брошенных на полку папок. "
-				+ "Кнопка «Очистить полку» удаляет только этот подкаталог. "
-				+ "Уже созданные архивы при смене папки не переносятся."
+			text: "A \"file-shelf\" subdirectory is created inside the specified "
+			+ "folder — it stores zip archives of folders dropped onto the shelf. "
+			+ "The \"Clear shelf\" button only removes this subdirectory. "
+			+ "Existing archives are not moved when changing the folder."
 		}
 	}
 }
