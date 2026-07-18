@@ -14,6 +14,10 @@
 			<label>Icon shown in the panel</label>
 			<default>document-multiple</default>
 		</entry>
+		<entry name="stripMode" type="Bool">
+			<label>Show the panel representation as a fading white strip instead of an icon</label>
+			<default>true</default>
+		</entry>
 		<entry name="hoverWidth" type="Int">
 			<label>Width in pixels of the panel hover/drop area; 0 means icon size</label>
 			<default>0</default>

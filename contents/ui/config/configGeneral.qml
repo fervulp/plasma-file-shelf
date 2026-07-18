@@ -13,6 +13,7 @@ KCM.SimpleKCM {
 	property var cfg_fileList
 	property alias cfg_cacheDir: dirField.text
 	property alias cfg_hoverWidth: hoverSpin.value
+	property alias cfg_stripMode: stripModeCheck.checked
 	property alias cfg_edgeOpen: edgeOpenCheck.checked
 	property string cfg_edgeOpenEdge
 	property string cfg_panelIcon
@@ -20,7 +21,14 @@ KCM.SimpleKCM {
 	// SimpleKCM expects exactly ONE child-content, so all
 	// non-visual dialogs are nested inside form elements
 	Kirigami.FormLayout {
+		QQC2.CheckBox {
+			id: stripModeCheck
+			Kirigami.FormData.label: "Panel look:"
+			text: "Fading white strip instead of an icon"
+		}
+
 		RowLayout {
+			enabled: !stripModeCheck.checked
 			Kirigami.FormData.label: "Panel icon:"
 			spacing: Kirigami.Units.smallSpacing
 

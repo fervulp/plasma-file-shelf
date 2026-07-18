@@ -20,6 +20,7 @@ import org.kde.plasma.extras as PlasmaExtras
 import org.kde.plasma.plasma5support as P5Support
 import org.kde.kirigami as Kirigami
 import org.kde.draganddrop as DnD
+import Qt5Compat.GraphicalEffects as Effects
 
 PlasmoidItem {
 	id: root
@@ -676,12 +677,88 @@ PlasmoidItem {
 					}
 				}
 
+				readonly property bool stripMode: plasmoid.configuration.stripMode === true
+
 				Kirigami.Icon {
+					visible: !compact.stripMode
 					anchors.centerIn: parent
 					width: Math.min(parent.width, parent.height)
 					height: width
 					source: plasmoid.configuration.panelIcon || "document-multiple"
 					active: compact.containsMouse
+				}
+
+				// вид «полоска»: тонкая белая линия сверху и белый градиент,
+				// затухающий вниз на ~30 px (как белая тень). Затухание — по
+				// плавной кривой (несколько промежуточных стопов), реакция на
+				// наведение анимирована.
+				Item {
+					visible: compact.stripMode
+					anchors.fill: parent
+
+					// содержимое полоски (рисуется через маску краёв ниже)
+					Item {
+						id: stripContent
+						anchors.fill: parent
+						visible: false
+
+						Rectangle {
+							anchors.top: parent.top
+							anchors.left: parent.left
+							anchors.right: parent.right
+							height: Math.min(30, parent.height)
+							opacity: compact.containsMouse ? 1 : 0.7
+							Behavior on opacity {
+								NumberAnimation { duration: 350; easing.type: Easing.OutQuad }
+							}
+							gradient: Gradient {
+								GradientStop { position: 0.00; color: Qt.rgba(1, 1, 1, 0.45) }
+								GradientStop { position: 0.15; color: Qt.rgba(1, 1, 1, 0.30) }
+								GradientStop { position: 0.35; color: Qt.rgba(1, 1, 1, 0.16) }
+								GradientStop { position: 0.55; color: Qt.rgba(1, 1, 1, 0.08) }
+								GradientStop { position: 0.75; color: Qt.rgba(1, 1, 1, 0.03) }
+								GradientStop { position: 1.00; color: Qt.rgba(1, 1, 1, 0) }
+							}
+						}
+
+						// линия без резкой кромки: собственный микроградиент,
+						// растворяющийся в основное затухание
+						Rectangle {
+							anchors.top: parent.top
+							anchors.left: parent.left
+							anchors.right: parent.right
+							height: 4
+							opacity: compact.containsMouse ? 1 : 0.8
+							Behavior on opacity {
+								NumberAnimation { duration: 350; easing.type: Easing.OutQuad }
+							}
+							gradient: Gradient {
+								GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.95) }
+								GradientStop { position: 0.5; color: Qt.rgba(1, 1, 1, 0.55) }
+								GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0) }
+							}
+						}
+					}
+
+					// маска: плавное растворение полоски у левого и правого краёв
+					Rectangle {
+						id: stripMask
+						anchors.fill: parent
+						visible: false
+						gradient: Gradient {
+							orientation: Gradient.Horizontal
+							GradientStop { position: 0.00; color: "transparent" }
+							GradientStop { position: 0.18; color: "white" }
+							GradientStop { position: 0.82; color: "white" }
+							GradientStop { position: 1.00; color: "transparent" }
+						}
+					}
+
+					Effects.OpacityMask {
+						anchors.fill: parent
+						source: stripContent
+						maskSource: stripMask
+					}
 				}
 
 				Rectangle {
