@@ -1,3 +1,4 @@
 *.plasmoid
 build/
 *.user
+demo.mp4
