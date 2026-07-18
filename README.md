@@ -4,7 +4,11 @@ A temporary drag-and-drop file shelf for the KDE Plasma panel, inspired by
 Dropover on macOS. Drop files onto the panel icon to stage them, then drag
 them out — one by one or all at once — into any other application.
 
-![screenshot placeholder](screenshot.png)
+
+
+https://github.com/user-attachments/assets/df044597-bc67-4db9-831d-7000140e9ef8
+
+
 
 ## Features
 
