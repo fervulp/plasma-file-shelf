@@ -15,6 +15,7 @@ KCM.SimpleKCM {
 	property alias cfg_hoverWidth: hoverSpin.value
 	property alias cfg_stripMode: stripModeCheck.checked
 	property alias cfg_edgeOpen: edgeOpenCheck.checked
+	property alias cfg_panelBandOpen: panelBandCheck.checked
 	property string cfg_edgeOpenEdge
 	property string cfg_panelIcon
 
@@ -78,8 +79,13 @@ KCM.SimpleKCM {
 		Item { Kirigami.FormData.isSection: true }
 
 		QQC2.CheckBox {
-			id: edgeOpenCheck
+			id: panelBandCheck
 			Kirigami.FormData.label: "Drag and drop:"
+			text: "Open shelf when a drag touches the panel"
+		}
+
+		QQC2.CheckBox {
+			id: edgeOpenCheck
 			text: "Open shelf at screen edge"
 		}
 

@@ -794,6 +794,31 @@ PlasmoidItem {
 								root.addText(event.mimeData.text)
 					}
 				}
+
+				// Невидимая drop-полоса на ВСЮ длину панели (QML не обрезает
+				// потомков границами апплета): перетаскиваемый файл, коснувшись
+				// панели в любом месте, пересекает её внутренний край — и полка
+				// открывается. Реагирует только на drag, кликам не мешает.
+				DnD.DropArea {
+					visible: plasmoid.configuration.panelBandOpen === true
+					width: 20000
+					x: -10000 + compact.width / 2
+					height: 10
+					// полоса у края панели, обращённого к рабочему столу
+					y: plasmoid.location === PlasmaCore.Types.TopEdge
+						? compact.height - height : 0
+					onDragEnter: {
+						autoCloseTimer.stop()
+						root.autoOpened = true
+						root.expanded = true
+					}
+					onDrop: event => {
+						if (event.mimeData.urls && event.mimeData.urls.length > 0)
+							root.addUrls(event.mimeData.urls)
+						else if (event.mimeData.text && event.mimeData.text.length > 0)
+							root.addText(event.mimeData.text)
+					}
+				}
 			}
 
 			fullRepresentation: Item {

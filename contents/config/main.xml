@@ -22,6 +22,10 @@
 			<label>Width in pixels of the panel hover/drop area; 0 means icon size</label>
 			<default>0</default>
 		</entry>
+		<entry name="panelBandOpen" type="Bool">
+			<label>Open the shelf when a drag touches the panel anywhere along its length</label>
+			<default>true</default>
+		</entry>
 		<entry name="edgeOpen" type="Bool">
 			<label>Open the shelf when a drag touches a screen edge strip</label>
 			<default>false</default>
